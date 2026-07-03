@@ -1,0 +1,29 @@
+# Keep the build context small and secrets out of the image.
+node_modules
+.next
+.git
+.gitignore
+
+# Secrets / local env — never bake into an image.
+.env
+.env.*
+!.env.example
+!.env.docker.example
+
+# Docs & local-only stuff (not needed inside the image).
+docs
+*.md
+!AGENTS.md
+!CLAUDE.md
+
+# Editor / OS noise
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Local Prisma generated client is regenerated during the build.
+lib/db/generated
+
+# Unrelated reference project checked into the repo.
+sinchin_admin-master
