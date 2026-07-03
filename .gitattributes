@@ -1,0 +1,5 @@
+# Keep LF endings on files that run on the Linux server (devs work on Windows).
+# CRLF in a shell script or Makefile recipe breaks execution.
+*.sh        text eol=lf
+Makefile    text eol=lf
+*.template  text eol=lf

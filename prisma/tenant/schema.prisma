@@ -1,0 +1,501 @@
+// Per-tenant (per-salon) schema. Every salon gets its OWN database with these
+// tables — physical isolation, zero cross-tenant data bleed. This identical
+// schema is deployed (`db push`) to N databases; the connection is chosen per
+// request from the control-plane Tenant registry (see prisma/control).
+//
+// Generates the DEFAULT client (`@prisma/client`) so existing feature code that
+// imports types/`PrismaClient` from "@prisma/client" keeps working unchanged.
+// Run `npm run tenant:push -- <DATABASE_URL>` after editing to roll out to a DB.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Overridden per-tenant at runtime via `datasourceUrl`; this env var is only
+  // used by the Prisma CLI (db push) against a single target database.
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Users & roles
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  master // super-admin: access to every workspace
+  tenant // workspace admin: scoped to its own workspace only
+  customer // public end-user
+}
+
+model User {
+  id          String     @id @default(cuid())
+  name        String
+  email       String     @unique
+  phone       String?
+  password    String
+  role        UserRole   @default(customer)
+  // For `tenant` users only — the workspace they are bound to. Within a tenant
+  // DB there is exactly one workspace, so this is now effectively constant.
+  workspaceId String?
+  workspace   Workspace? @relation("WorkspaceMembers", fields: [workspaceId], references: [id], onDelete: SetNull)
+  // Permission role for panel access control. Null = unrestricted (back-compat):
+  // a tenant admin without an explicit role keeps full access.
+  roleId      String?
+  roleRef     Role?      @relation(fields: [roleId], references: [id], onDelete: SetNull)
+  // Free-text staff annotations on a customer (e.g. preferences, allergies).
+  notes       String     @default("")
+  bookings    Booking[]
+  passwordResets PasswordResetToken[]
+  refreshTokens  RefreshToken[]
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  @@index([workspaceId])
+  @@index([roleId])
+}
+
+enum BookingStatus {
+  pending
+  confirmed
+  completed
+  cancelled
+  no_show
+}
+
+/// active | inactive — shared by catalog/staff records.
+enum RecordStatus {
+  active
+  inactive
+}
+
+model Booking {
+  id           String        @id @default(cuid())
+  reference    String        @unique
+  customerName String
+  // Lowercased owner email — matches guest bookings to a user when they sign in.
+  email        String
+  phone        String?
+  // Name snapshots (kept even if the catalog entry is later renamed/removed).
+  service      String
+  staff        String?
+  // Links to the catalog entries the booking was made against (nullable so guest
+  // bookings and historical data survive a service/staff deletion).
+  serviceId    String?
+  serviceRef   Service?      @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  staffId      String?
+  staffRef     Staff?        @relation(fields: [staffId], references: [id], onDelete: SetNull)
+  // Price/duration snapshots resolved from the service at booking time.
+  price        Int?
+  duration     Int?
+  date         DateTime
+  time         String // "HH:mm"
+  status       BookingStatus @default(pending)
+  userId       String?
+  user         User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+  payments     Payment[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([userId])
+  @@index([email])
+  @@index([serviceId])
+  @@index([staffId])
+  // Defense-in-depth against exact-slot double-booking. NULL staffId rows are
+  // treated as distinct by Postgres, so legacy "any stylist" rows are unaffected;
+  // overlap safety is guaranteed by the advisory lock in the booking use case.
+  @@unique([staffId, date, time])
+}
+
+// ---------------------------------------------------------------------------
+// CMS (one workspace row per tenant DB)
+// ---------------------------------------------------------------------------
+
+enum ContentStatus {
+  draft
+  published
+}
+
+model Workspace {
+  id          String        @id @default(cuid())
+  name        String
+  slug        String        @unique
+  domain      String        @default("")
+  plan        String        @default("starter")
+  status      String        @default("active")
+  accent      String        @default("#2d3b64")
+  owner       String        @default("") // display label only
+  isPrimary   Boolean       @default(false)
+  members     User[]        @relation("WorkspaceMembers")
+  pages       CmsPage[]
+  media       MediaAsset[]
+  settings    SiteSettings?
+  // Core operations
+  serviceCategories ServiceCategory[]
+  services          Service[]
+  staff             Staff[]
+  salonSettings     SalonSettings?
+  reviews           Review[]
+  leaveRequests     LeaveRequest[]
+  roles             Role[]
+  integrationSettings IntegrationSettings?
+  contactMessages   ContactMessage[]
+  subscribers       Subscriber[]
+  payments          Payment[]
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+}
+
+model CmsPage {
+  id          String        @id @default(cuid())
+  workspaceId String
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  title       String
+  slug        String
+  status      ContentStatus @default(draft)
+  blocks      Json          @default("[]") // Block[]
+  seo         Json          @default("{}") // CmsPageSeo
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@unique([workspaceId, slug])
+  @@index([workspaceId])
+}
+
+model MediaAsset {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  url         String
+  // Storage object key in the Supabase bucket — used to delete the file later.
+  path        String?
+  sizeKb      Int       @default(0)
+  width       Int       @default(0)
+  height      Int       @default(0)
+  uploadedAt  DateTime  @default(now())
+
+  @@index([workspaceId])
+}
+
+model SiteSettings {
+  id            String    @id @default(cuid())
+  workspaceId   String    @unique
+  workspace     Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  appearance    Json      @default("{}") // SiteAppearance
+  headerMenu    Json      @default("{}") // { links: MenuLink[], buttons: NavButton[] }
+  footerColumns Json      @default("{}") // { columns: FooterColumn[], copyright: string }
+  socialLinks   Json      @default("[]") // SocialLink[]
+  updatedAt     DateTime  @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Core operations (services, staff, opening hours)
+// ---------------------------------------------------------------------------
+
+model ServiceCategory {
+  id          String       @id @default(cuid())
+  workspaceId String
+  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  description String       @default("")
+  status      RecordStatus @default(active)
+  services    Service[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([workspaceId])
+}
+
+model Service {
+  id          String          @id @default(cuid())
+  workspaceId String
+  workspace   Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  categoryId  String
+  category    ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  name        String
+  description String          @default("")
+  price       Int // whole currency units
+  duration    Int // minutes
+  status      RecordStatus    @default(active)
+  // Online-payment deposit (only enforced when the salon uses a paying gateway).
+  requiresDeposit Boolean     @default(false)
+  depositAmount   Int? // whole currency units; null = no deposit set
+  bookings    Booking[]
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@index([workspaceId])
+  @@index([categoryId])
+}
+
+model Staff {
+  id          String       @id @default(cuid())
+  workspaceId String
+  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  email       String
+  phone       String?
+  role        String       @default("") // role label (kept in sync with roleRef.name)
+  roleId      String? // FK to the workspace Role (nullable: staff may be unassigned)
+  roleRef     Role?        @relation(fields: [roleId], references: [id], onDelete: SetNull)
+  specialties String[]
+  status      RecordStatus @default(active)
+  image       String       @default("") // media library URL (empty when none)
+  joinedDate  String       @default("") // date-only label e.g. "2022-01-20"
+  bookings    Booking[]
+  leaveRequests LeaveRequest[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([workspaceId])
+}
+
+// One row per workspace — opening hours + appointment settings. Distinct from
+// the CMS `SiteSettings` (branding/menus).
+model SalonSettings {
+  id                  String    @id @default(cuid())
+  workspaceId         String    @unique
+  workspace           Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  openingHours        Json      @default("[]") // OpeningHour[]
+  closures            Json      @default("[]") // Closure[]
+  slotDurationMinutes Int       @default(30)
+  // Turnaround/cleanup time reserved after each appointment before the staff
+  // member is free again. 0 = back-to-back bookings allowed.
+  bufferMinutes       Int       @default(0)
+  // Deposit-refund cutoff: a cancellation made at least this many hours before the
+  // appointment is refunded in full; inside the window the deposit is forfeited.
+  cancellationCutoffHours Int   @default(24)
+  // Salon business details (shown on the public site / receipts / emails).
+  tagline             String    @default("")
+  contactEmail        String    @default("")
+  contactPhone        String    @default("")
+  address             String    @default("")
+  currency            String    @default("gbp")
+  timezone            String    @default("Europe/London")
+  // ISO-3166 alpha-2 default country for phone-number inputs on the storefront.
+  defaultCountry      String    @default("GB")
+  // Per-salon notification toggles (keyed by id, read by the email layer).
+  notificationPrefs   Json      @default("{}")
+  updatedAt           DateTime  @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Reviews — customer feedback, moderated for the public site
+// ---------------------------------------------------------------------------
+
+model Review {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  customer    String
+  service     String // service name snapshot
+  rating      Int // 1..5
+  comment     String    @default("")
+  // Optional link to the originating booking (no FK relation — kept loose so a
+  // deleted booking doesn't cascade away the review).
+  bookingId   String?
+  published   Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([workspaceId])
+  @@index([bookingId])
+}
+
+// ---------------------------------------------------------------------------
+// Leave management — staff time-off requests
+// ---------------------------------------------------------------------------
+
+// Suffixed `Db` to avoid clashing with the same-named UI DTO unions in
+// lib/admin/types.ts (LeaveStatus / LeaveType). Values match those unions.
+enum LeaveStatusDb {
+  pending
+  approved
+  rejected
+}
+
+enum LeaveTypeDb {
+  annual
+  sick
+  unpaid
+  maternity
+  other
+}
+
+model LeaveRequest {
+  id          String        @id @default(cuid())
+  workspaceId String
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  staffId     String
+  staffRef    Staff         @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  staff       String // staff name snapshot
+  type        LeaveTypeDb   @default(annual)
+  from        DateTime
+  to          DateTime
+  reason      String        @default("")
+  status      LeaveStatusDb @default(pending)
+  appliedOn   DateTime      @default(now())
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([workspaceId])
+  @@index([staffId])
+}
+
+// ---------------------------------------------------------------------------
+// Roles — named permission sets staff can be assigned to
+// ---------------------------------------------------------------------------
+
+model Role {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  description String    @default("")
+  permissions String[] // permission keys from lib/auth/permissions.ts
+  staff       Staff[]
+  users       User[] // panel users assigned this role (access control)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([workspaceId])
+}
+
+// ---------------------------------------------------------------------------
+// Integrations — per-salon third-party config. Secret fields are AES-256-GCM
+// ciphertext (lib/crypto/secret.ts); never returned decrypted to the client.
+// ---------------------------------------------------------------------------
+
+model IntegrationSettings {
+  id          String    @id @default(cuid())
+  workspaceId String    @unique
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  // Email (Resend, per-salon sender)
+  resendApiKeyEnc String?
+  emailFrom       String?
+  emailReplyTo    String?
+  emailEnabled    Boolean @default(false)
+  // Payments — chosen gateway (must be enabled in the control-plane registry) +
+  // its per-provider credentials. "none" = pay at salon, no online payment.
+  paymentProvider        String  @default("none")
+  stripeSecretKeyEnc     String?
+  stripePublishableKey   String?
+  stripeWebhookSecretEnc String?
+  updatedAt   DateTime  @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Auth — password reset tokens (only the hash is stored)
+// ---------------------------------------------------------------------------
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// Long-lived refresh tokens (only the hash is stored). Issued on login for both
+// `customer` and `tenant`-admin users (both are User rows here); `scope` records
+// which surface the session belongs to. Rotated on every refresh — the old row
+// gets `revokedAt` set and a new one is created. `revokedAt` also supports
+// logout and theft-response (revoke-all).
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  scope     String // "customer" | "admin"
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+enum EmailOtpPurpose {
+  signup
+  booking
+}
+
+// Short-lived one-time passcodes proving control of an email before a customer
+// account is created (`signup`) or a guest booking is taken (`booking`). Not tied
+// to a User row — these flows run before any account exists. Only the code hash is
+// stored; brute force is bounded by `expiresAt` + the `attempts` cap and a single
+// active code per (email, purpose). A new request supersedes any prior code.
+model EmailOtp {
+  id         String          @id @default(cuid())
+  email      String // always lowercased
+  purpose    EmailOtpPurpose
+  codeHash   String // sha256 of the 6-digit code
+  expiresAt  DateTime
+  consumedAt DateTime?
+  attempts   Int             @default(0)
+  createdAt  DateTime        @default(now())
+
+  @@index([email, purpose])
+}
+
+// ---------------------------------------------------------------------------
+// Marketing / contact — public form captures
+// ---------------------------------------------------------------------------
+
+model ContactMessage {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  email       String
+  subject     String    @default("")
+  message     String
+  createdAt   DateTime  @default(now())
+
+  @@index([workspaceId])
+}
+
+model Subscriber {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  email       String
+  createdAt   DateTime  @default(now())
+
+  @@unique([workspaceId, email])
+  @@index([workspaceId])
+}
+
+// ---------------------------------------------------------------------------
+// Payments — a deposit/charge tracked against a booking
+// ---------------------------------------------------------------------------
+
+enum PaymentStatus {
+  pending
+  paid
+  failed
+  refunded
+}
+
+model Payment {
+  id          String        @id @default(cuid())
+  workspaceId String
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  bookingId   String
+  booking     Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  provider    String // "stripe" | future…
+  amount      Int // whole currency units
+  currency    String        @default("gbp")
+  status      PaymentStatus @default(pending)
+  providerRef String? // e.g. Stripe checkout session / payment intent id
+  refundRef   String? // Stripe refund id, set when the deposit is refunded
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([workspaceId])
+  @@index([bookingId])
+}

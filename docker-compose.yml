@@ -1,0 +1,76 @@
+# Multi-tenant salon platform — single-server deployment.
+#
+#   nginx (:80)  ──▶  app (:3000, Next standalone)  ──▶  postgres (:5432)
+#
+# TLS is terminated upstream (Cloudflare / load balancer); nginx speaks HTTP only.
+# Tenant routing happens inside the app from the request Host header, so nginx
+# just proxies every domain to the one app container.
+#
+# Usage:
+#   docker compose build
+#   docker compose up -d postgres
+#   docker compose run --rm tools npm run control:push
+#   docker compose run --rm tools npm run control:seed
+#   docker compose up -d app nginx
+#
+# See docs/deployment.md for the full walkthrough.
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-sma_control}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Expose to the host only if you need to connect with an external client.
+    # ports:
+    #   - "5432:5432"
+
+  app:
+    build:
+      context: .
+      target: runner
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "3000"
+
+  nginx:
+    image: nginx:1.27
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - app
+
+  # One-off operations container (migrations, provisioning). Never started by
+  # `docker compose up` thanks to the profile. Run with:
+  #   docker compose run --rm tools npm run migrate:all-tenants
+  tools:
+    build:
+      context: .
+      target: tools
+    profiles:
+      - tools
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

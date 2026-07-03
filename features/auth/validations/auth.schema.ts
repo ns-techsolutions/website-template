@@ -1,0 +1,82 @@
+import { z } from "zod";
+
+import { otpCodeSchema } from "@/features/email-otp/validations/email-otp.schema";
+import { optionalPhone } from "@/lib/phone/validation";
+
+export const registerSchema = z.object({
+  name: z.string().trim().min(1, "Name is required"),
+  email: z.string().trim().toLowerCase().email("Enter a valid email address"),
+  phone: optionalPhone,
+  password: z.string().min(6, "Password must be at least 6 characters"),
+});
+
+// Server-side register payload: the form fields plus the email-verification code.
+// `code` is optional because salons without email configured skip verification
+// (see consumeEmailOtp). The form validates `registerSchema` on its details step.
+export const registerWithCodeSchema = registerSchema.extend({
+  code: otpCodeSchema.optional(),
+});
+
+export const loginSchema = z.object({
+  email: z.string().trim().toLowerCase().email("Enter a valid email address"),
+  password: z.string().min(1, "Password is required"),
+});
+
+export const updateProfileSchema = z
+  .object({
+    name: z.string().trim().min(1, "Name is required").optional(),
+    email: z.string().trim().toLowerCase().email("Enter a valid email address").optional(),
+    phone: optionalPhone,
+  })
+  .refine((v) => Object.keys(v).length > 0, { message: "No fields to update" });
+
+export const accountProfileFormSchema = z.object({
+  name: z.string().trim().min(1, "Name is required"),
+  email: z.string().trim().toLowerCase().email("Enter a valid email address"),
+  phone: optionalPhone,
+});
+
+export const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1, "Current password is required"),
+  newPassword: z.string().min(6, "Password must be at least 6 characters"),
+});
+
+export const changePasswordFormSchema = z
+  .object({
+    currentPassword: z.string().min(1, "Current password is required"),
+    newPassword: z.string().min(6, "Password must be at least 6 characters"),
+    confirmPassword: z.string().min(1, "Please confirm your new password"),
+  })
+  .refine((v) => v.newPassword === v.confirmPassword, {
+    message: "Passwords do not match",
+    path: ["confirmPassword"],
+  });
+
+export const forgotPasswordSchema = z.object({
+  email: z.string().trim().toLowerCase().email("Enter a valid email address"),
+});
+
+export const resetPasswordSchema = z.object({
+  token: z.string().min(1, "Reset token is required"),
+  newPassword: z.string().min(6, "Password must be at least 6 characters"),
+});
+
+export const resetPasswordFormSchema = z
+  .object({
+    newPassword: z.string().min(6, "Password must be at least 6 characters"),
+    confirmPassword: z.string().min(1, "Please confirm your new password"),
+  })
+  .refine((v) => v.newPassword === v.confirmPassword, {
+    message: "Passwords do not match",
+    path: ["confirmPassword"],
+  });
+
+export type RegisterInput = z.infer<typeof registerSchema>;
+export type LoginInput = z.infer<typeof loginSchema>;
+export type UpdateProfileInput = z.infer<typeof updateProfileSchema>;
+export type AccountProfileFormInput = z.infer<typeof accountProfileFormSchema>;
+export type ChangePasswordInput = z.infer<typeof changePasswordSchema>;
+export type ChangePasswordFormInput = z.infer<typeof changePasswordFormSchema>;
+export type ForgotPasswordInput = z.infer<typeof forgotPasswordSchema>;
+export type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;
+export type ResetPasswordFormInput = z.infer<typeof resetPasswordFormSchema>;
