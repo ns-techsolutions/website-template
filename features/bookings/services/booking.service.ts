@@ -38,7 +38,11 @@ export const bookingService = {
 
   /** Public lookup by reference — the random reference acts as the access token. */
   async getByReference(reference: string): Promise<BookingView> {
-    const booking = await bookingRepository.findByReference(reference);
+    // References are always generated uppercase (e.g. "RB-XXXX"), but Postgres
+    // string equality is case-sensitive. Normalize the incoming value so a guest
+    // pasting a lowercased reference doesn't get a spurious 404.
+    const normalized = reference.trim().toUpperCase();
+    const booking = await bookingRepository.findByReference(normalized);
     if (!booking) throw new NotFoundError("Booking not found.");
     return toBookingView(booking);
   },
