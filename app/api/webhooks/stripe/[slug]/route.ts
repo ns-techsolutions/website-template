@@ -63,6 +63,12 @@ export async function POST(
       const payment = await paymentRepository.findByProviderRef(result.providerRef);
       if (!payment) return;
 
+      // Stripe delivers webhooks at-least-once and retries on any non-2xx or
+      // timeout. Only a still-pending payment should be confirmed here — otherwise
+      // a redelivery after a refund/cancellation would flip the payment back to
+      // paid and re-confirm a cancelled booking. Idempotency guard:
+      if (payment.status !== PaymentStatus.pending) return;
+
       await paymentRepository.updateStatus(payment.id, PaymentStatus.paid);
       await bookingRepository.update(payment.bookingId, { status: "confirmed" });
     });
