@@ -1,0 +1,108 @@
+name: Deploy to Cloud Run
+
+# Builds the app + tools images and deploys them. Migrations are NOT run here
+# (see migrate-cloudrun.yml) — same split as the Makefile's `deploy` vs.
+# `control-push`/`migrate-tenants` targets for the VM deployment.
+#
+# One-time setup required before this workflow can run: scripts/ops/gcp/bootstrap-gcp.sh
+# and the repo vars/secrets it prints at the end. See docs/deployment-gcp.md.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation
+
+concurrency:
+  group: deploy-cloudrun
+  cancel-in-progress: false
+
+env:
+  AR_HOST: ${{ vars.GCP_REGION }}-docker.pkg.dev
+  APP_IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/sma-app
+  TOOLS_IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/sma-tools
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${AR_HOST}" --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push app image (runner stage)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runner
+          push: true
+          tags: |
+            ${{ env.APP_IMAGE }}:${{ github.sha }}
+            ${{ env.APP_IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & push tools image (migrations/provisioning)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: tools
+          push: true
+          tags: |
+            ${{ env.TOOLS_IMAGE }}:${{ github.sha }}
+            ${{ env.TOOLS_IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resolve Cloud SQL connection name
+        id: sql
+        run: |
+          echo "connection_name=$(gcloud sql instances describe "${{ vars.CLOUDSQL_INSTANCE }}" --format='value(connectionName)')" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Cloud Run service
+        run: |
+          # --env-vars-file (YAML) instead of --set-env-vars: the comma-separated
+          # K=V,K=V syntax breaks if any value contains a comma (e.g. a brand name).
+          cat >/tmp/env-vars.yaml <<EOF
+          NODE_ENV: "production"
+          PLATFORM_HOST: "${{ vars.PLATFORM_HOST }}"
+          PLATFORM_BRAND_NAME: "${{ vars.PLATFORM_BRAND_NAME }}"
+          NEXT_PUBLIC_SITE_URL: "${{ vars.NEXT_PUBLIC_SITE_URL }}"
+          JWT_ACCESS_TTL: "${{ vars.JWT_ACCESS_TTL }}"
+          STORAGE_PROVIDER: "${{ vars.STORAGE_PROVIDER }}"
+          GCS_MEDIA_BUCKET: "${{ vars.GCS_MEDIA_BUCKET }}"
+          EOF
+          gcloud run deploy "${{ vars.SERVICE_NAME }}" \
+            --image="${{ env.APP_IMAGE }}:${{ github.sha }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --service-account="${{ vars.RUNTIME_SA_NAME }}@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
+            --add-cloudsql-instances="${{ steps.sql.outputs.connection_name }}" \
+            --ingress=internal-and-cloud-load-balancing \
+            --allow-unauthenticated \
+            --set-secrets="CONTROL_DATABASE_URL=sma-control-database-url:latest,TENANT_DB_ENC_KEY=sma-tenant-db-enc-key:latest,JWT_ACCESS_SECRET=sma-jwt-access-secret:latest" \
+            --env-vars-file=/tmp/env-vars.yaml \
+            --quiet
+
+      - name: Update migration job images
+        run: |
+          for job in sma-tools-control-push sma-tools-control-seed sma-tools-migrate-tenants sma-tools-backfill-system-pages; do
+            gcloud run jobs update "$job" \
+              --region="${{ vars.GCP_REGION }}" \
+              --image="${{ env.TOOLS_IMAGE }}:${{ github.sha }}" \
+              --quiet
+          done

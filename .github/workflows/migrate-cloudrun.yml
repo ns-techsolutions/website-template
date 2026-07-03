@@ -1,0 +1,45 @@
+name: Migrate (Cloud Run)
+
+# Manual equivalent of `make control-push` / `make control-seed` /
+# `make migrate-tenants` for the Cloud Run deployment. Runs the named Cloud
+# Run Job (created by scripts/ops/gcp/bootstrap-gcp.sh, kept up to date with
+# the latest tools image by deploy-cloudrun.yml) and waits for it to finish.
+#
+# Deliberately NOT run automatically on every push — schema changes are an
+# explicit, reviewed action, same as on the VM deployment.
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: Migration task to run
+        required: true
+        type: choice
+        options:
+          - control-push
+          - control-seed
+          - migrate-tenants
+          - backfill-system-pages
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Execute sma-tools-${{ inputs.task }}
+        run: |
+          gcloud run jobs execute "sma-tools-${{ inputs.task }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --wait
