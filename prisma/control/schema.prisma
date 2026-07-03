@@ -1,0 +1,78 @@
+// Control-plane schema. This is the SINGLE shared database the platform itself
+// uses. It holds only:
+//   - the Tenant registry (which salon → which private database)
+//   - master/super-admin accounts
+// It never holds any per-salon (tenant) data — that lives in each salon's own
+// database (see prisma/tenant). Generated to a custom output so it can't be
+// confused with the default tenant client (`@prisma/client`).
+//
+// Run `npm run control:push` after editing.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../lib/db/generated/control"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("CONTROL_DATABASE_URL")
+}
+
+// Registry mapping a salon to its private database + how requests route to it.
+model Tenant {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  // Custom domain the salon is served on — the request host resolves to this.
+  domain      String   @unique
+  // Encrypted Postgres connection string for this salon's private database.
+  // Decrypted only server-side (see lib/crypto/secret.ts). Never logged/headers.
+  databaseUrl String
+  plan        String   @default("starter")
+  status      String   @default("active")
+  accent      String   @default("#2d3b64")
+  owner       String   @default("")
+  // Fallback tenant used in local dev / unknown hosts.
+  isPrimary   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// Platform super-admins. They sign in on the platform host and manage the
+// Tenant registry. (Per-salon `tenant` admins live in their own salon DB.)
+model MasterAdmin {
+  id        String   @id @default(cuid())
+  name      String
+  email     String   @unique
+  password  String
+  refreshTokens MasterRefreshToken[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Long-lived refresh tokens for platform super-admins (only the hash is stored).
+// Master admins live in the control plane, so their refresh tokens do too.
+// Rotated on every refresh; `revokedAt` supports logout and theft-response.
+model MasterRefreshToken {
+  id        String      @id @default(cuid())
+  adminId   String
+  admin     MasterAdmin @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  tokenHash String      @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime    @default(now())
+
+  @@index([adminId])
+}
+
+// Platform-wide registry of payment gateways salons may use. The master admin
+// toggles `enabled`; a salon can only select an enabled provider. Adding a new
+// gateway = a code adapter (lib/payments/providers) + a row here.
+model PaymentGateway {
+  id        String   @id @default(cuid())
+  provider  String   @unique // "none" | "stripe" | future…
+  label     String
+  enabled   Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
